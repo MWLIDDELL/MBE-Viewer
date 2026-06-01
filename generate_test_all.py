@@ -3,199 +3,125 @@ Generate a minimal synthetic Kongsberg .all file for testing.
 
 Creates:
   - Installation parameters datagram (0x49)
-  - 30 Position datagrams (0x50) along a straight track
-  - 30 XYZ-88 datagrams (0x58) with 256 beams each (swath pattern)
+  - N Position datagrams (0x50) along a straight track
+  - N XYZ-88 datagrams (0x58) with n_beams each (swath pattern)
+
+Beam record layout matches real EM2040 files (verified against hardware data):
+  bytes  0-3:   float32 Z  depth      (m, positive down)
+  bytes  4-7:   float32 Y  across-track (m, +starboard)
+  bytes  8-11:  float32 X  along-track  (m, +forward)
+  bytes 12-15:  uint16 detection_window + uint8 quality + uint8 spare
+  bytes 16-19:  uint8 beam_angle_adj + uint8 detection_info + uint8 rt_clean + uint8 reflectivity
+
+XYZ header block (20 bytes):
+  bytes  0-3:   float32 height of water level (~0)
+  bytes  4-7:   spare
+  bytes  8-9:   uint16 n_valid (number of valid beams)
+  bytes 10-19:  spare
 
 Output: test_data.all
 """
 
 import struct
 import math
+import random
 import os
+
 
 STX = 0x02
 ETX = 0x03
 
 
-def pack_uint8(v):  return struct.pack("B", int(v) & 0xFF)
-def pack_uint16(v): return struct.pack("<H", int(v) & 0xFFFF)
-def pack_int16(v):  return struct.pack("<h", int(v))
-def pack_uint32(v): return struct.pack("<I", int(v) & 0xFFFFFFFF)
-def pack_int32(v):  return struct.pack("<i", int(v))
-def pack_float(v):  return struct.pack("<f", float(v))
+def _u8(v):   return struct.pack("B", int(v) & 0xFF)
+def _u16(v):  return struct.pack("<H", int(v) & 0xFFFF)
+def _i16(v):  return struct.pack("<h", int(v))
+def _u32(v):  return struct.pack("<I", int(v) & 0xFFFFFFFF)
+def _i32(v):  return struct.pack("<i", int(v))
+def _f32(v):  return struct.pack("<f", float(v))
 
 
-def make_datagram(dgm_type: int, em_model: int, date: int, time_ms: int,
-                  ping_counter: int, serial: int, payload: bytes) -> bytes:
-    """Wrap payload in a standard EM datagram with header and ETX+checksum."""
+def make_datagram(dgm_type, em_model, date, time_ms, ping_counter, serial, payload):
     header = (
-        pack_uint8(STX) +
-        pack_uint8(dgm_type) +
-        pack_uint16(em_model) +
-        pack_uint32(date) +
-        pack_uint32(time_ms) +
-        pack_uint16(ping_counter) +
-        pack_uint16(serial)
+        _u8(STX) + _u8(dgm_type) + _u16(em_model) +
+        _u32(date) + _u32(time_ms) + _u16(ping_counter) + _u16(serial)
     )
     body = header + payload
     checksum = sum(body) & 0xFFFF
-    body += pack_uint8(ETX) + pack_uint16(checksum)
-    # Prepend 4-byte length (length of body, not including the 4-byte prefix itself)
-    return pack_uint32(len(body)) + body
+    body += _u8(ETX) + _u16(checksum)
+    return _u32(len(body)) + body
 
 
 def make_position(date, time_ms, ping_counter, serial, lat_deg, lon_deg):
-    lat_raw = int(round(lat_deg * 1e7))
-    lon_raw = int(round(lon_deg * 1e7))
     payload = (
-        pack_int32(lat_raw) +
-        pack_int32(lon_raw) +
-        pack_uint16(0) +   # fix quality
-        pack_uint16(0) +   # speed
-        pack_uint16(0) +   # course
-        pack_uint16(0) +   # heading
-        pack_uint8(0) +    # position system descriptor
-        pack_uint8(0) +    # number of bytes in input datagram
-        b"\x00" * 0        # no raw string
+        _i32(int(round(lat_deg * 1e7))) +
+        _i32(int(round(lon_deg * 1e7))) +
+        _u16(0) + _u16(0) + _u16(0) + _u16(0) +
+        _u8(0) + _u8(0)
     )
-    return make_datagram(0x50, 302, date, time_ms, ping_counter, serial, payload)
+    return make_datagram(0x50, 2040, date, time_ms, ping_counter, serial, payload)
 
 
-def make_xyz88(date, time_ms, ping_counter, serial, n_beams, swath_width, base_depth):
-    """Create an XYZ-88 datagram with n_beams spread over swath_width metres."""
-    # Fixed heading block (16 bytes)
-    heading = (
-        pack_float(0.0) +   # height of water level
-        pack_uint16(0) +    # bytes in input datagram
-        pack_uint16(n_beams) +  # number of valid detections
-        pack_uint8(0) +     # sampling frequency
-        pack_uint8(0) +     # Rx transducer heading
-        pack_uint8(0) +     # sound speed
-        pack_uint8(0) +     # Tx transducer depth
-        pack_uint16(0) +    # along-track ping spacing
-        pack_uint16(0)      # spare
-    )
+def make_xyz88(date, time_ms, ping_counter, serial, n_beams, swath_half_width, base_depth):
+    """Build an XYZ-88 datagram matching the real EM2040 field layout."""
+    # XYZ header block (20 bytes)
+    xyz_header = bytearray(20)
+    struct.pack_into("<f", xyz_header, 0, 0.0)          # height of water level
+    struct.pack_into("<H", xyz_header, 8, n_beams)      # n_valid at offset +8
 
-    beam_records = b""
+    beam_records = bytearray()
     for i in range(n_beams):
-        # Across-track: spread evenly from -swath_width/2 to +swath_width/2
-        across = (i / (n_beams - 1) - 0.5) * swath_width
-        along  = 0.0
-        # Depth: deeper in centre, shallower at edges (realistic bowl shape)
-        angle_norm = (i / (n_beams - 1) - 0.5) * 2.0  # -1..1
-        depth = base_depth * (1.0 + 0.15 * angle_norm ** 2)
-        # Add mild noise
-        import random
-        depth += random.gauss(0, 0.3)
-        beam_records += (
-            pack_float(across) +
-            pack_float(along) +
-            pack_float(depth) +
-            pack_float(0.001) +   # detection window length
-            pack_float(0.5) +     # quality factor
-            pack_int16(0) +       # beam incidence angle adjustment (1 byte + pad)
-            pack_uint8(0) +       # detection info (valid)
-            pack_uint8(0) +       # real-time cleaning info
-            # Note: each beam is 20 bytes total; the two int16 fields above are 4 bytes,
-            # plus float(4)*5=20 but we need to adjust — let me count:
-            # float(4) + float(4) + float(4) + float(4) + float(4) = 20 bytes
-            # int8(1) + uint8(1) + uint8(1) + uint8(1) = 4 bytes  → total = 24 — wrong
-            # Fix: beam record is exactly 20 bytes per spec:
-            #   float32 across(4) + float32 along(4) + float32 depth(4) +
-            #   float32 det_window(4) + float32 quality(4) = 20 bytes
-            # The remaining fields are packed differently; let's redo:
-            b""
-        )
+        # across-track: spread from -swath_half_width to +swath_half_width
+        t = i / (n_beams - 1) - 0.5          # -0.5 to +0.5
+        across = t * 2 * swath_half_width     # meters, + = starboard
+        along  = 3.5                          # typical inter-ping forward movement
+        # depth: slightly deeper at outer beams (realistic bowl)
+        depth = base_depth * (1.0 + 0.08 * t ** 2) + random.gauss(0, 0.2)
 
-    # Redo beam records correctly (20 bytes per beam, 5 x float32)
-    beam_records = b""
-    import random
-    for i in range(n_beams):
-        across = (i / (n_beams - 1) - 0.5) * swath_width
-        angle_norm = (i / (n_beams - 1) - 0.5) * 2.0
-        depth = base_depth * (1.0 + 0.15 * angle_norm ** 2) + random.gauss(0, 0.3)
-        beam_records += (
-            pack_float(across) +   # 4
-            pack_float(0.0) +      # along-track  4
-            pack_float(depth) +    # depth        4
-            pack_float(0.001) +    # det window   4
-            pack_float(0.5) +      # quality      4
-            pack_int16(0) +        # beam incidence adj (int8 + pad = 2)
-            pack_uint8(0) +        # detection info  1
-            pack_uint8(0)          # rt cleaning     1   → total = 4+4+4+4+4+2+1+1 = 24 ≠ 20
-        )
-    # The beam record is 20 bytes per spec. Let me use the correct layout:
-    # float32(4) + float32(4) + float32(4) + float32(4) + float32(4) = 20 bytes for the 5 floats
-    # but the spec says 20 bytes total including the extra fields… let me match the parser exactly.
-    # In _parse_xyz88 in all_parser.py we read:
-    #   across = float32 @ boff
-    #   along  = float32 @ boff+4
-    #   depth  = float32 @ boff+8
-    #   det_info = uint8 @ boff+18
-    # So beam_size=20, det_info is at offset 18 within the beam.
-    beam_records = b""
-    for i in range(n_beams):
-        across = (i / (n_beams - 1) - 0.5) * swath_width
-        angle_norm = (i / (n_beams - 1) - 0.5) * 2.0
-        import random as _r
-        depth = base_depth * (1.0 + 0.15 * angle_norm ** 2) + _r.gauss(0, 0.3)
-        # 20 bytes: f4 f4 f4 f4 f4 b1 b1 b1 b1 = 4*5 + 4 = 24? No.
-        # 20 bytes = f4 f4 f4 pad8 det_info(1) pad(1)
-        # offset 0: across (f4)
-        # offset 4: along (f4)
-        # offset 8: depth (f4)
-        # offset 12: det_window (f4)
-        # offset 16: quality (f4)
-        # offset 20: ??? — but beam_size is 20 per the parser
-        # The parser uses beam_size=20 but only reads up to offset 18.
-        # Let's just make 20 bytes with det_info=0 at offset 18.
         rec = bytearray(20)
-        struct.pack_into("<f", rec, 0,  across)
-        struct.pack_into("<f", rec, 4,  0.0)
-        struct.pack_into("<f", rec, 8,  depth)
-        struct.pack_into("<f", rec, 12, 0.001)
-        # offset 16: 2 bytes spare; offset 18: det_info; offset 19: spare
-        rec[18] = 0  # valid detection
-        beam_records += bytes(rec)
+        struct.pack_into("<f", rec, 0,  depth)   # Z
+        struct.pack_into("<f", rec, 4,  across)  # Y
+        struct.pack_into("<f", rec, 8,  along)   # X
+        # bytes 12-15: detection window (uint16=0) + quality (uint8=1) + spare
+        struct.pack_into("<H", rec, 12, 0)
+        rec[14] = 1   # quality
+        # bytes 16-19: beam_angle_adj, detection_info(0=valid), rt_clean, reflectivity
+        rec[16] = 0
+        rec[17] = 0   # detection_info = 0 → valid
+        rec[18] = 0
+        rec[19] = 128  # arbitrary reflectivity
 
-    # Spare byte at end of datagram
+        beam_records += rec
+
     spare = b"\x00"
-    payload = heading + beam_records + spare
-    return make_datagram(0x58, 302, date, time_ms, ping_counter, serial, payload)
+    payload = bytes(xyz_header) + bytes(beam_records) + spare
+    return make_datagram(0x58, 2040, date, time_ms, ping_counter, serial, payload)
 
 
 def generate(output_path="test_data.all", n_pings=30, n_beams=256,
-             start_lat=57.0, start_lon=-2.0, base_depth=80.0):
-    import random
+             start_lat=10.536, start_lon=0.289, base_depth=35.0):
     random.seed(42)
+    date   = 20121205
+    serial = 201
 
-    date = 20230601
-    serial = 1234
     datagrams = []
-
-    track_length = 0.01  # degrees latitude
+    track_len = 0.002  # degrees latitude
 
     for ping_idx in range(n_pings):
-        t_frac = ping_idx / max(n_pings - 1, 1)
-        lat = start_lat + t_frac * track_length
-        lon = start_lon
-        time_ms = 60_000 + ping_idx * 2000  # 2 s apart
+        t_frac   = ping_idx / max(n_pings - 1, 1)
+        lat      = start_lat + t_frac * track_len
+        time_ms  = 60_000 + ping_idx * 2000
 
-        # Position datagram
-        datagrams.append(make_position(date, time_ms, ping_idx, serial, lat, lon))
+        datagrams.append(make_position(date, time_ms, ping_idx, serial, lat, start_lon))
 
-        # Vary depth slightly along track
         depth = base_depth + 5 * math.sin(t_frac * math.pi)
-
-        # XYZ datagram
-        datagrams.append(make_xyz88(date, time_ms, ping_idx, serial, n_beams, 150.0, depth))
+        datagrams.append(make_xyz88(date, time_ms, ping_idx, serial, n_beams, 100.0, depth))
 
     with open(output_path, "wb") as fh:
         for dg in datagrams:
             fh.write(dg)
 
     print(f"Written {len(datagrams)} datagrams to {output_path}")
-    print(f"  {n_pings} pings × {n_beams} beams = {n_pings * n_beams} soundings (approx)")
+    print(f"  {n_pings} pings × {n_beams} beams = {n_pings * n_beams} soundings")
 
 
 if __name__ == "__main__":

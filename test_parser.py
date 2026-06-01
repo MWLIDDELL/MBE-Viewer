@@ -25,12 +25,12 @@ def test_basic_parse():
 
     # Check depths are sensible
     depths = [s.depth for s in result.soundings]
-    assert all(50 < d < 150 for d in depths), f"Depths out of range: {min(depths):.1f} – {max(depths):.1f}"
+    assert all(20 < d < 60 for d in depths), f"Depths out of range: {min(depths):.1f} – {max(depths):.1f}"
 
     # Check lat/lon have been assigned
     lats = [s.latitude for s in result.soundings]
     lons = [s.longitude for s in result.soundings]
-    assert all(56 < la < 58 for la in lats), f"Latitudes unexpected: {min(lats):.4f} – {max(lats):.4f}"
+    assert all(10 < la < 11 for la in lats), f"Latitudes unexpected: {min(lats):.4f} – {max(lats):.4f}"
 
     print(f"PASS: {len(result.soundings)} soundings, "
           f"depth {min(depths):.1f}–{max(depths):.1f} m, "

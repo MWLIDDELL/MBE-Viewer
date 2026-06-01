@@ -145,67 +145,54 @@ def _parse_xyz88(buf, offset, num_bytes, ping_counter):
     Parse XYZ 88 datagram and return list of Sounding objects.
 
     Datagram layout (after 20-byte common header):
-      float32  height of water level re vessel (m)
-      uint16   number of bytes in input datagram
-      uint16   number of valid detections
-      uint8    sampling frequency (enum)
-      uint8    Rx transducer heading (1/100 deg from keel)
-      uint8    sound speed at transducer (dm/s - 14.5 offset)
-      uint8    Tx transducer depth (cm)
-      uint16   along-track ping spacing (1/256 m)
-      uint8    spare (x2 / alignment)
-      -- then N beam records --
+      XYZ header block (20 bytes):
+        float32  height of water level re vessel (m)         [+0]
+        uint16   sampling / spare                            [+4]
+        uint16   spare                                       [+6]
+        uint16   number of valid detections                  [+8]
+        uint16   sampling frequency                          [+10]
+        uint32   spare                                       [+12]
+        uint32   spare                                       [+16]
+      -- then N beam records (20 bytes each) --
     Each beam record (20 bytes):
-      float32  across-track distance (m)
-      float32  along-track distance (m)
-      float32  depth (m, positive down)
-      float32  detection window length (sec)
-      float32  quality factor
-      int8     beam incidence angle adjustment (1/10 deg)
-      uint8    detection info
-      uint8    real-time cleaning info
-      uint8    reflectivity (0.5 dB)
+        float32  Z depth (m, positive down)                  [+0]
+        float32  Y across-track (m, +starboard)              [+4]
+        float32  X along-track  (m, +forward)                [+8]
+        uint16   detection window                            [+12]
+        uint8    quality                                     [+14]
+        uint8    spare                                       [+15]
+        uint8    beam incidence angle adj                    [+16]
+        uint8    detection info (bit 7: 0=valid, 1=invalid)  [+17]
+        uint8    real-time cleaning info                     [+18]
+        uint8    reflectivity                                [+19]
     """
     base = offset + 20
-    if base + 12 > len(buf):
-        return []
-
-    # Skip the fixed-size heading block (12 bytes) to get to beam count
-    # heading block: float32 + uint16 + uint16 + uint8 + uint8 + uint8 + uint8 + uint16 + uint8 + uint8 = 16 bytes
-    heading_size = 16
+    heading_size = 20
     if base + heading_size > len(buf):
         return []
 
-    # Parse heading fields
-    # height_wl     = struct.unpack_from("<f", buf, base)[0]          # unused
-    n_bytes_input = _read_uint16(buf, base + 4)
-    n_valid       = _read_uint16(buf, base + 6)
-    # sampling_freq = _read_uint8(buf, base + 8)
-    # rx_heading    = _read_uint8(buf, base + 9)
-    # ss_transducer = _read_uint8(buf, base + 10)
-    # tx_depth      = _read_uint8(buf, base + 11)
-    # along_spacing = _read_uint16(buf, base + 12)
-    # spare         = _read_uint16(buf, base + 14)
+    # Number of valid detections is at byte offset +8 within the XYZ header
+    n_valid = _read_uint16(buf, base + 8)
 
     beam_base = base + heading_size
     beam_size = 20
     soundings = []
 
-    end_of_datagram = offset + 4 + num_bytes  # the 4-byte length field is not included in num_bytes
-    max_beams = (end_of_datagram - beam_base - 2) // beam_size  # -2 for spare at end
+    end_of_datagram = offset + 4 + num_bytes
+    max_beams = min(n_valid, (end_of_datagram - beam_base - 2) // beam_size)
 
     for i in range(max_beams):
         boff = beam_base + i * beam_size
         if boff + beam_size > len(buf):
             break
-        across = struct.unpack_from("<f", buf, boff)[0]
-        along  = struct.unpack_from("<f", buf, boff + 4)[0]
-        depth  = struct.unpack_from("<f", buf, boff + 8)[0]
-        det_info = _read_uint8(buf, boff + 18)
-        # skip invalid detections (bit 7 set in detection info = invalid)
+        depth  = struct.unpack_from("<f", buf, boff)[0]
+        across = struct.unpack_from("<f", buf, boff + 4)[0]
+        along  = struct.unpack_from("<f", buf, boff + 8)[0]
+        det_info = _read_uint8(buf, boff + 17)
+        # bit 7 of detection_info: 0 = valid detection
         if det_info & 0x80:
             continue
-        if math.isnan(depth) or math.isinf(depth) or abs(depth) > 12000:
+        if math.isnan(depth) or math.isinf(depth) or depth <= 0 or depth > 12000:
             continue
         soundings.append(Sounding(
             longitude=0.0, latitude=0.0,
